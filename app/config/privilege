@@ -1,0 +1,5 @@
+{
+    "defaults":{"run-as":"package"},
+    "username": "docker-junyao-ktv",
+    "groupname": "docker-junyao-ktv"
+}
