@@ -8,44 +8,21 @@ const MV_DIR = process.env.MV_DIR || '/mv';
 const MV_NET_DIR = process.env.MV_NET_DIR || '/mv-net';
 const VIDEO_EXT = ['.mp4', '.mkv', '.avi', '.flv', '.mov', '.webm', '.mpg'];
 
-/**
- * ----------------------------------------------------
- * 1. 容器内完整版 index.js 强依赖的全部导出函数 (解决 500 报错)
- * ----------------------------------------------------
- */
-function getMVDir() {
-  return MV_DIR;
-}
-
-function getMVNetDir() {
-  return MV_NET_DIR;
-}
-
+function getMVDir() { return MV_DIR; }
+function getMVNetDir() { return MV_NET_DIR; }
 function getMVRoots() {
   if (!fs.existsSync(MV_DIR)) return [];
   try {
-    return fs.readdirSync(MV_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => d.name);
-  } catch (e) {
-    return [];
-  }
+    return fs.readdirSync(MV_DIR, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
+  } catch (e) { return []; }
 }
-
 function getMVNetRoots() {
   if (!fs.existsSync(MV_NET_DIR)) return [];
   try {
-    return fs.readdirSync(MV_NET_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => d.name);
-  } catch (e) {
-    return [];
-  }
+    return fs.readdirSync(MV_NET_DIR, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
+  } catch (e) { return []; }
 }
-
-function getLibraryRoots() {
-  return getMVRoots();
-}
+function getLibraryRoots() { return getMVRoots(); }
 
 function isProblemAudioCodec(codec) {
   if (!codec) return false;
@@ -62,10 +39,7 @@ function isProblemVideoCodec(codec) {
 function probeDurationAsync(filepath) {
   return new Promise((resolve) => {
     execFile('ffprobe', [
-      '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'csv=p=0',
-      filepath
+      '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', filepath
     ], { timeout: 15000 }, (err, stdout) => {
       if (err) resolve(0);
       else {
@@ -80,56 +54,84 @@ async function ensureProbedOnDemand(songId) {
   try {
     const song = db.prepare('SELECT filepath, audio_tracks FROM songs WHERE id = ?').get(songId);
     if (!song) return 1;
-    if (song.audio_tracks !== null && song.audio_tracks !== undefined) {
-      return song.audio_tracks;
-    }
+    if (song.audio_tracks !== null && song.audio_tracks !== undefined) return song.audio_tracks;
     const count = probeAudioTracks(song.filepath);
     db.prepare('UPDATE songs SET audio_tracks = ? WHERE id = ?').run(count, songId);
     return count;
-  } catch (e) {
-    return 1;
-  }
-}
-
-function syncSongArtists() {
-  try {
-    const songs = db.prepare('SELECT DISTINCT artist FROM songs WHERE artist IS NOT NULL AND artist != ""').all();
-    const insertArtist = db.prepare('INSERT OR IGNORE INTO artists (name) VALUES (?)');
-    db.transaction(() => {
-      for (const s of songs) {
-        if (s.artist) insertArtist.run(s.artist);
-      }
-    })();
-  } catch (e) {
-    // 忽略找不到 artists 表时的静默异常
-  }
+  } catch (e) { return 1; }
 }
 
 /**
- * ----------------------------------------------------
- * 2. 数据库安全自动扩展
- * ----------------------------------------------------
+ * 修复：全方位填充与建进 artists 歌手索引表
  */
+function syncSongArtists() {
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS artists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        artist TEXT,
+        count INTEGER DEFAULT 1,
+        avatar TEXT
+      )
+    `);
+
+    // 安全增加可能缺失的列
+    try {
+      const columns = db.prepare("PRAGMA table_info(artists)").all().map(c => c.name);
+      if (!columns.includes('name')) db.exec("ALTER TABLE artists ADD COLUMN name TEXT");
+      if (!columns.includes('artist')) db.exec("ALTER TABLE artists ADD COLUMN artist TEXT");
+      if (!columns.includes('count')) db.exec("ALTER TABLE artists ADD COLUMN count INTEGER DEFAULT 1");
+    } catch (e) {}
+
+    // 清空重构歌手索引
+    db.exec("DELETE FROM artists");
+
+    const songs = db.prepare('SELECT artist FROM songs WHERE artist IS NOT NULL AND artist != "" AND artist != "未知歌手"').all();
+    const artistCountMap = new Map();
+
+    for (const s of songs) {
+      if (s.artist) {
+        const multi = String(s.artist).split(/[/,&、]/);
+        for (const a of multi) {
+          const cleanName = a.trim();
+          if (cleanName && cleanName !== '未知歌手') {
+            artistCountMap.set(cleanName, (artistCountMap.get(cleanName) || 0) + 1);
+          }
+        }
+      }
+    }
+
+    const insertArtist = db.prepare('INSERT INTO artists (name, artist, count) VALUES (?, ?, ?)');
+    db.transaction(() => {
+      for (const [artistName, count] of artistCountMap.entries()) {
+        try {
+          insertArtist.run(artistName, artistName, count);
+        } catch (e) {}
+      }
+    })();
+    console.log(`[SCAN] 歌手表同步成功，共构建 ${artistCountMap.size} 位歌手数据。`);
+  } catch (e) {
+    console.error('[SCAN] 同步歌手表失败:', e.message);
+  }
+}
+
 function ensureDbColumns() {
   try {
     const columns = db.prepare("PRAGMA table_info(songs)").all().map(c => c.name);
-    if (!columns.includes('language')) {
-      db.exec("ALTER TABLE songs ADD COLUMN language TEXT");
-    }
-    if (!columns.includes('style')) {
-      db.exec("ALTER TABLE songs ADD COLUMN style TEXT");
-    }
+    if (!columns.includes('language')) db.exec("ALTER TABLE songs ADD COLUMN language TEXT");
+    if (!columns.includes('style')) db.exec("ALTER TABLE songs ADD COLUMN style TEXT");
   } catch (e) {
     console.error('检查/更新数据库字段失败:', e.message);
   }
 }
 
-/**
- * ----------------------------------------------------
- * 3. CSV 优先映射解析引擎
- * ----------------------------------------------------
- */
 const songCsvMap = new Map();
+
+function normalizeKey(str) {
+  if (!str) return '';
+  return String(str).trim().toLowerCase().replace(/^0+/, '');
+}
 
 function parseCsvLine(line) {
   const cleanLine = line.replace(/^\uFEFF/, '').replace(/\r$/, '').trim();
@@ -163,13 +165,13 @@ function loadSongMappingCsv(dirPath) {
     const lines = content.split(/\r?\n/);
     if (lines.length <= 1) return;
 
-    const header = parseCsvLine(lines[0]).map(h => h.toLowerCase());
+    const header = parseCsvLine(lines[0]).map(h => h.toLowerCase().replace(/\s+/g, ''));
 
-    const idxNumber = header.findIndex(h => ['number', 'songid', 'id', '编号'].includes(h));
-    const idxTitle = header.findIndex(h => ['title', 'songname', '歌名', '歌曲名'].includes(h));
-    const idxArtist = header.findIndex(h => ['artist', 'singer', '歌手', '演唱者'].includes(h));
-    const idxLanguage = header.findIndex(h => ['language', 'lang', '语种'].includes(h));
-    const idxStyle = header.findIndex(h => ['style', 'genre', '风格'].includes(h));
+    const idxNumber = header.findIndex(h => ['number', 'songid', 'id', '编号', '歌曲编号'].includes(h));
+    const idxTitle = header.findIndex(h => ['title', 'songname', '歌名', '歌曲名', '名字'].includes(h));
+    const idxArtist = header.findIndex(h => ['artist', 'singer', '歌手', '演唱者', '原唱'].includes(h));
+    const idxLanguage = header.findIndex(h => ['language', 'lang', '语种', '语言'].includes(h));
+    const idxStyle = header.findIndex(h => ['style', 'genre', '风格', '分类'].includes(h));
     const idxFilename = header.findIndex(h => ['filename', 'file', '文件名'].includes(h));
 
     let loadedCount = 0;
@@ -178,7 +180,7 @@ function loadSongMappingCsv(dirPath) {
       if (!line || !line.trim()) continue;
 
       const parts = parseCsvLine(line);
-      const songNumber = idxNumber !== -1 && parts[idxNumber] ? String(parts[idxNumber]).trim() : null;
+      const songNumber = idxNumber !== -1 && parts[idxNumber] ? parts[idxNumber].trim() : null;
       const filename = idxFilename !== -1 && parts[idxFilename] ? parts[idxFilename].trim() : null;
       const title = idxTitle !== -1 && parts[idxTitle] ? parts[idxTitle].trim() : null;
       const artist = idxArtist !== -1 && parts[idxArtist] ? parts[idxArtist].trim() : null;
@@ -188,17 +190,17 @@ function loadSongMappingCsv(dirPath) {
       const record = { title, artist, language, style };
 
       if (songNumber) {
+        songCsvMap.set(normalizeKey(songNumber), record);
         songCsvMap.set(songNumber, record);
-        songCsvMap.set(String(parseInt(songNumber, 10)), record);
       }
       if (filename) {
-        songCsvMap.set(filename, record);
+        songCsvMap.set(normalizeKey(filename), record);
         const base = path.basename(filename, path.extname(filename));
-        songCsvMap.set(base, record);
+        songCsvMap.set(normalizeKey(base), record);
       }
       loadedCount++;
     }
-    console.log(`[CSV Engine] 成功从 ${path.basename(csvPath)} 载入 ${loadedCount} 条记录。`);
+    console.log(`[CSV Engine] 成功从 ${path.basename(csvPath)} 载入 ${loadedCount} 条数据。`);
   } catch (err) {
     console.error(`[CSV Engine] 读取 CSV 失败 (${csvPath}):`, err.message);
   }
@@ -207,16 +209,11 @@ function loadSongMappingCsv(dirPath) {
 function probeAudioTracks(filepath) {
   try {
     const out = execFileSync('ffprobe', [
-      '-v', 'error',
-      '-select_streams', 'a',
-      '-show_entries', 'stream=index',
-      '-of', 'csv=p=0',
-      filepath
+      '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filepath
     ], { timeout: 15000 }).toString();
     const count = out.split('\n').map(l => l.trim()).filter(Boolean).length;
     return count > 0 ? count : 1;
   } catch (e) {
-    console.error('ffprobe 音轨检测失败(' + path.basename(filepath) + '):', e.message);
     return 1;
   }
 }
@@ -231,7 +228,6 @@ function listFilesRecursive(dir) {
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (e) {
-    console.error('曲库目录读取失败，已跳过(' + dir + '):', e.message);
     return results;
   }
   for (const entry of entries) {
@@ -240,9 +236,7 @@ function listFilesRecursive(dir) {
     let isDir;
     try {
       isDir = entry.isDirectory() || fs.statSync(full).isDirectory();
-    } catch (e) {
-      continue;
-    }
+    } catch (e) { continue; }
     if (isDir) {
       results = results.concat(listFilesRecursive(full));
     } else if (VIDEO_EXT.includes(path.extname(entry.name).toLowerCase())) {
@@ -253,7 +247,8 @@ function listFilesRecursive(dir) {
 }
 
 function parseFilename(filename) {
-  const base = path.basename(filename, path.extname(filename));
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
   const fullName = path.basename(filename);
 
   let defaultArtist = '未知歌手';
@@ -263,9 +258,7 @@ function parseFilename(filename) {
   const idMatch = base.match(/^(\d+)\s*[-_]?\s*(.*)$/);
   if (idMatch) {
     extractedId = String(idMatch[1]).trim();
-    if (idMatch[2]) {
-      defaultTitle = idMatch[2].trim();
-    }
+    if (idMatch[2]) defaultTitle = idMatch[2].trim();
   }
 
   if (!idMatch) {
@@ -284,7 +277,15 @@ function parseFilename(filename) {
     }
   }
 
-  const keysToTry = [extractedId, fullName, base].filter(Boolean);
+  const keysToTry = [
+    normalizeKey(extractedId),
+    normalizeKey(fullName),
+    normalizeKey(base),
+    extractedId,
+    fullName,
+    base
+  ].filter(Boolean);
+
   for (const key of keysToTry) {
     if (songCsvMap.has(key)) {
       const csvData = songCsvMap.get(key);
@@ -306,12 +307,10 @@ function yieldToEventLoop() {
 
 async function scanLibrary() {
   if (!fs.existsSync(MV_DIR)) {
-    console.error('曲库目录不可访问，已跳过本次扫描以避免误删曲库:', MV_DIR);
     return { total: 0, added: 0, removed: 0, error: 'MV_DIR_UNAVAILABLE' };
   }
 
   ensureDbColumns();
-
   songCsvMap.clear();
   loadSongMappingCsv(MV_DIR);
 
@@ -349,7 +348,7 @@ async function scanLibrary() {
       });
       if (!existingSet.has(rel) && r.changes > 0) added++;
     } catch (e) {
-      console.error('曲库扫描-新增文件入库失败(' + rel + '):', e.message);
+      console.error('曲库扫描-入库失败(' + rel + '):', e.message);
     }
     await yieldToEventLoop();
   }
@@ -362,14 +361,10 @@ async function scanLibrary() {
     for (const row of pending) {
       try {
         upd.run(probeAudioTracks(row.filepath), row.id);
-      } catch (e) {
-        console.error('曲库扫描-音轨补全失败(id=' + row.id + '):', e.message);
-      }
+      } catch (e) {}
       await yieldToEventLoop();
     }
-  } catch (e) {
-    console.error('曲库扫描-音轨补全阶段失败:', e.message);
-  }
+  } catch (e) {}
 
   let removed = 0;
   try {
@@ -393,23 +388,14 @@ async function scanLibrary() {
           delSongAndRefs(row.id);
           removeHLS(row.id);
           removed++;
-        } catch (e) {
-          console.error('曲库扫描-删除已缺失曲目失败(id=' + row.id + '):', e.message);
-        }
+        } catch (e) {}
       }
     }
-  } catch (e) {
-    console.error('曲库扫描-清理缺失文件阶段失败:', e.message);
-  }
+  } catch (e) {}
 
   return { total: files.length, added, removed };
 }
 
-/**
- * ----------------------------------------------------
- * 4. 导出全套函数 (彻底满足 2000 多行容器内 index.js 的 require)
- * ----------------------------------------------------
- */
 module.exports = {
   scanLibrary,
   MV_DIR,
